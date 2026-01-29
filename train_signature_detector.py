@@ -1,10 +1,13 @@
+"""
+Simple CNN signature detector training (Faster R-CNN with ResNet50 backbone).
+"""
+
 import argparse
 import csv
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import torch
 from PIL import Image
@@ -19,30 +22,32 @@ from tqdm import tqdm
 @dataclass
 class Row:
     image_path: str
-    bboxes: List[List[float]]  # normalized [x1,y1,x2,y2]
+    bboxes: List[List[float]]
 
 
 def read_rows(labels_csv: str, document_root: str | None = None) -> List[Row]:
-    rows: List[Row] = []
-    labels_dir = Path(labels_csv).resolve().parent
-    with open(labels_csv, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
+    """Read rows from labels.csv with bbox annotations."""
+    rows = []
+    labels_dir = Path(labels_csv).parent
+    
+    with open(labels_csv, "r", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
             img_path = r["document_path"]
-            # Resolve relative paths in a robust way:
-            # 1) absolute paths as-is
-            # 2) relative to the labels.csv directory (common for exports)
-            # 3) if a document_root is provided, fallback to document_root/<filename>
-            if not os.path.isabs(img_path):
-                p1 = (labels_dir / img_path).resolve()
-                if p1.exists():
-                    img_path = str(p1)
-                elif document_root:
-                    img_path = str((Path(document_root) / Path(img_path).name).resolve())
-            bboxes = json.loads(r["bbox_json"]) if r.get("bbox_json") else []
+            
+            # Resolve path: absolute -> relative to CSV -> document_root fallback
+            if not Path(img_path).is_absolute():
+                p = (labels_dir / img_path).resolve()
+                if not p.exists() and document_root:
+                    p = Path(document_root) / Path(img_path).name
+                img_path = str(p.resolve())
+            
+            # Parse bboxes
+            bboxes = json.loads(r.get("bbox_json", "[]"))
             if not isinstance(bboxes, list):
                 bboxes = []
+            
             rows.append(Row(image_path=img_path, bboxes=bboxes))
+    
     return rows
 
 
@@ -58,42 +63,28 @@ class SignatureDetectionDataset(Dataset):
         img = Image.open(row.image_path).convert("RGB")
         w, h = img.size
 
-        # Convert to absolute pixel coords (clamped)
-        boxes_abs: List[List[float]] = []
+        # Convert normalized bboxes to pixel coordinates
+        boxes = []
         for b in row.bboxes:
             if not (isinstance(b, list) and len(b) == 4):
                 continue
-            x1, y1, x2, y2 = b
-            x1 = max(0.0, min(1.0, float(x1)))
-            y1 = max(0.0, min(1.0, float(y1)))
-            x2 = max(0.0, min(1.0, float(x2)))
-            y2 = max(0.0, min(1.0, float(y2)))
-            # Ensure proper ordering
-            x_min, x_max = (x1, x2) if x1 <= x2 else (x2, x1)
-            y_min, y_max = (y1, y2) if y1 <= y2 else (y2, y1)
-            # Convert to pixels
-            boxes_abs.append([x_min * w, y_min * h, x_max * w, y_max * h])
+            x1, y1, x2, y2 = [max(0.0, min(1.0, float(x))) for x in b]
+            x_min, x_max = sorted([x1, x2])
+            y_min, y_max = sorted([y1, y2])
+            boxes.append([x_min * w, y_min * h, x_max * w, y_max * h])
 
-        boxes = torch.tensor(boxes_abs, dtype=torch.float32)
-        labels = torch.ones((boxes.shape[0],), dtype=torch.int64)  # 1 = "signature"
-
-        target: Dict[str, torch.Tensor] = {
-            "boxes": boxes,
-            "labels": labels,
+        boxes_t = torch.tensor(boxes, dtype=torch.float32)
+        labels_t = torch.ones(len(boxes), dtype=torch.int64)
+        
+        return F.to_tensor(img), {
+            "boxes": boxes_t,
+            "labels": labels_t,
             "image_id": torch.tensor([idx]),
         }
 
-        img_t = F.to_tensor(img)  # float32 [0,1]
-        return img_t, target
-
-
-def collate_fn(batch):
-    images, targets = zip(*batch)
-    return list(images), list(targets)
-
 
 def make_model(num_classes: int = 2) -> FasterRCNN:
-    # CNN backbone (ResNet50-FPN) + detector head
+    """Create Faster R-CNN model with ResNet50-FPN backbone."""
     model = fasterrcnn_resnet50_fpn(weights="DEFAULT")
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
@@ -101,16 +92,113 @@ def make_model(num_classes: int = 2) -> FasterRCNN:
 
 
 @torch.no_grad()
-def evaluate_one_epoch(model, loader, device) -> float:
-    model.eval()
-    losses: List[float] = []
+def evaluate(model, loader, device) -> float:
+    """Evaluate model on validation set."""
+    model.train()  # Need train mode to compute losses
+    losses = []
     for images, targets in loader:
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         loss_dict = model(images, targets)
-        loss = sum(loss_dict.values()).item()
-        losses.append(loss)
-    return float(sum(losses) / max(1, len(losses)))
+        if isinstance(loss_dict, dict):
+            losses.append(sum(loss_dict.values()).item())
+        else:
+            # Fallback if model returns something unexpected
+            losses.append(0.0)
+    model.eval()  # Set back to eval mode
+    return sum(losses) / len(losses) if losses else 0.0
+
+
+def train_chunk(
+    rows_chunk: List[Row],
+    model,
+    optimizer,
+    device,
+    epochs: int,
+    batch_size: int,
+    val_split: float,
+    num_workers: int,
+    chunk_num: int,
+    total_chunks: int,
+    gradient_accumulation: int = 1,
+):
+    """Train on a chunk of data with memory optimization."""
+    dataset = SignatureDetectionDataset(rows_chunk)
+    
+    # Train/val split
+    val_len = max(1, int(len(dataset) * val_split))
+    train_ds, val_ds = random_split(dataset, [len(dataset) - val_len, val_len])
+    
+    def collate_fn(batch):
+        images, targets = zip(*batch)
+        return list(images), list(targets)
+    
+    # Memory-optimized DataLoader settings
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=min(num_workers, 2),  # Limit workers to save memory
+        collate_fn=collate_fn,
+        pin_memory=False,  # Disable pin_memory to save GPU memory
+        persistent_workers=False,
+    )
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=max(1, batch_size // 2),  # Smaller batch for validation
+        shuffle=False,
+        num_workers=0,  # No workers for validation
+        collate_fn=collate_fn,
+        pin_memory=False,
+    )
+
+    best_val = float("inf")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        optimizer.zero_grad()
+        
+        pbar = tqdm(train_loader, desc=f"Chunk {chunk_num}/{total_chunks} - Epoch {epoch}/{epochs}")
+        accumulated_loss = 0.0
+        step_count = 0
+        
+        for batch_idx, (images, targets) in enumerate(pbar):
+            # Move to device
+            images = [img.to(device, non_blocking=False) for img in images]
+            targets = [{k: v.to(device, non_blocking=False) for k, v in t.items()} for t in targets]
+            
+            # Forward pass
+            loss_dict = model(images, targets)
+            loss = sum(loss_dict.values()) / gradient_accumulation  # Scale loss for accumulation
+            
+            # Backward pass
+            loss.backward()
+            accumulated_loss += loss.item() * gradient_accumulation
+            step_count += 1
+            
+            # Update weights every gradient_accumulation steps
+            if (batch_idx + 1) % gradient_accumulation == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                pbar.set_postfix(loss=f"{accumulated_loss/step_count:.4f}")
+        
+        # Final update if needed
+        if step_count % gradient_accumulation != 0:
+            optimizer.step()
+            optimizer.zero_grad()
+        
+        # Clear cache before validation
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        
+        val_loss = evaluate(model, val_loader, device)
+        print(f"Chunk {chunk_num}/{total_chunks} - Epoch {epoch}: val_loss={val_loss:.4f}")
+
+        if val_loss < best_val:
+            best_val = val_loss
+    
+    return best_val
 
 
 def train(
@@ -122,90 +210,95 @@ def train(
     lr: float,
     val_split: float,
     num_workers: int,
+    chunk_size: int = 1000,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
+    print(f"Device: {device}")
 
+    # Load all data
     rows = read_rows(labels_csv, document_root=document_dir)
-    dataset = SignatureDetectionDataset(rows)
+    print(f"Total samples: {len(rows)}")
+    print(f"Training in chunks of {chunk_size} samples\n")
 
-    val_len = max(1, int(len(dataset) * val_split))
-    train_len = len(dataset) - val_len
-    train_ds, val_ds = random_split(dataset, [train_len, val_len])
+    # Split into chunks
+    chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
+    total_chunks = len(chunks)
+    print(f"Split into {total_chunks} chunks\n")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-    )
-
+    # Initialize model
     model = make_model(num_classes=2).to(device)
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
+    # Calculate optimal gradient accumulation based on batch size
+    # For small GPUs, use gradient accumulation to simulate larger batches
+    effective_batch_size = batch_size
+    if device.type == "cuda":
+        # Auto-adjust for memory constraints
+        if batch_size > 2:
+            gradient_accumulation = max(1, batch_size // 2)
+            effective_batch_size = batch_size
+        else:
+            gradient_accumulation = 1
+    else:
+        gradient_accumulation = 1
+    
+    print(f"Batch size: {batch_size}, Gradient accumulation: {gradient_accumulation}")
+    print(f"Effective batch size: {effective_batch_size * gradient_accumulation}\n")
+
+    # Train on each chunk incrementally
     best_val = float("inf")
-    for epoch in range(1, epochs + 1):
-        model.train()
-        pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs}", leave=False)
-        for images, targets in pbar:
-            images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values())
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            pbar.set_postfix(loss=float(loss.item()))
-
-        val_loss = evaluate_one_epoch(model, val_loader, device)
-        print(f"epoch {epoch}: val_loss={val_loss:.4f}")
-
+    for chunk_num, rows_chunk in enumerate(chunks, 1):
+        print(f"\n{'='*60}")
+        print(f"Training on chunk {chunk_num}/{total_chunks} ({len(rows_chunk)} samples)")
+        print(f"{'='*60}\n")
+        
+        # Clear cache before each chunk
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        
+        val_loss = train_chunk(
+            rows_chunk, model, optimizer, device,
+            epochs, batch_size, val_split, num_workers,
+            chunk_num, total_chunks, gradient_accumulation
+        )
+        
+        # Save model after each chunk
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model_state": model.state_dict(),
+            "num_classes": 2,
+            "chunk": chunk_num,
+            "total_chunks": total_chunks,
+            "val_loss": val_loss,
+        }, out_path)
+        print(f"✓ Saved model after chunk {chunk_num} (val_loss={val_loss:.4f}) -> {out_path}")
+        
+        # Clear cache after saving
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        
         if val_loss < best_val:
             best_val = val_loss
-            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "model_state": model.state_dict(),
-                    "num_classes": 2,
-                },
-                out_path,
-            )
-            print(f"saved best model -> {out_path}")
+    
+    print(f"\n{'='*60}")
+    print(f"Training complete! Processed {len(rows)} samples in {total_chunks} chunks")
+    print(f"Best validation loss: {best_val:.4f}")
+    print(f"Final model saved to: {out_path}")
+    print(f"{'='*60}")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--document_dir",
-        default="/home/ram-sthapit/programming/Signature Verification/export_images/train/document",
-        help="Directory containing document images (png/jpg).",
-    )
-    ap.add_argument(
-        "--labels_csv",
-        default="/home/ram-sthapit/programming/Signature Verification/export_images/train/labels.csv",
-        help="CSV with bbox_json and document_path.",
-    )
-    ap.add_argument(
-        "--out",
-        default="/home/ram-sthapit/programming/Signature Verification/signature_detector.pt",
-        help="Where to save the trained model checkpoint.",
-    )
+    ap = argparse.ArgumentParser(description="Train CNN signature detector")
+    ap.add_argument("--labels_csv", default="/home/ram-sthapit/programming/Signature Verification/export_images/train/labels.csv")
+    ap.add_argument("--document_dir", default="/home/ram-sthapit/programming/Signature Verification/export_images/train/document")
+    ap.add_argument("--out", default="/home/ram-sthapit/programming/Signature Verification/signature_detector.pt")
     ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--batch_size", type=int, default=2)
+    ap.add_argument("--batch_size", type=int, default=1, help="Batch size (use 1 for small GPUs)")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--val_split", type=float, default=0.1)
-    ap.add_argument("--num_workers", type=int, default=2)
-    # Jupyter/IPython sometimes injects extra args like `--f=...`; ignore unknown args.
-    args, _unknown = ap.parse_known_args()
+    ap.add_argument("--num_workers", type=int, default=0, help="DataLoader workers (0-2 recommended for small GPUs)")
+    ap.add_argument("--chunk_size", type=int, default=1000, help="Number of samples to train on at a time")
+    args, _ = ap.parse_known_args()
 
     train(
         labels_csv=args.labels_csv,
@@ -216,10 +309,9 @@ def main():
         lr=args.lr,
         val_split=args.val_split,
         num_workers=args.num_workers,
+        chunk_size=args.chunk_size,
     )
 
 
 if __name__ == "__main__":
     main()
-
-
